@@ -42,10 +42,17 @@
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 5, 0)
 #include <linux/pfn_t.h>
 #endif
-
+#include <linux/delay.h>
 #include "nova_def.h"
 #include "journal.h"
 #include "stats.h"
+
+#define WH_DEBUG 0
+#define NVM_BLOCK_SHIFT 7//Right
+#define BLOCK_DELAY_SHIFT 6  //Left
+//#define JOURNAL_WRITE  
+#define NVM_DELAY
+//#define DYNAMIC_JOURNAL
 
 #define PAGE_SHIFT_2M 21
 #define PAGE_SHIFT_1G 30
@@ -371,7 +378,7 @@ struct free_list {
  * The second block contains pointers to journal pages.
  * The third block contains pointers to inode tables.
  */
-#define	RESERVED_BLOCKS	3
+#define	RESERVED_BLOCKS	4//Wang
 
 struct inode_map {
 	struct mutex inode_table_mutex;
@@ -442,6 +449,7 @@ struct nova_sb_info {
 	/* Shared free block list */
 	unsigned long per_list_blocks;
 	struct free_list shared_free_list;
+	spinlock_t *data_journal_locks;//Wang
 };
 
 static inline struct nova_sb_info *NOVA_SB(struct super_block *sb)
@@ -521,6 +529,18 @@ struct ptr_pair *nova_get_journal_pointers(struct super_block *sb, int cpu)
 	return (struct ptr_pair *)((char *)nova_get_block(sb,
 		NOVA_DEF_BLOCK_SIZE_4K)	+ cpu * CACHELINE_SIZE);
 }
+//Wang
+static inline
+struct ptr_pair *nova_get_data_journal_pointers(struct super_block *sb, int cpu)
+{
+	struct nova_sb_info *sbi = NOVA_SB(sb);
+
+	if (cpu >= sbi->cpus)
+		return NULL;	
+
+	return (struct ptr_pair *)((char *)nova_get_block(sb,
+		NOVA_DEF_BLOCK_SIZE_4K*3)	+ cpu * CACHELINE_SIZE);
+}
 
 struct inode_table {
 	__le64 log_head;
@@ -591,7 +611,9 @@ static inline int memcpy_to_pmem_nocache(void *dst, const void *src,
 	unsigned int size)
 {
 	int ret;
-
+#ifdef NVM_DELAY	
+	ndelay((((size-1)>>NVM_BLOCK_SHIFT)+1)<<BLOCK_DELAY_SHIFT);
+#endif
 	ret = __copy_from_user_inatomic_nocache(dst, src, size);
 
 	return ret;
@@ -918,6 +940,12 @@ int nova_dax_get_block(struct inode *inode, sector_t iblock,
 	struct buffer_head *bh, int create);
 int nova_dax_file_mmap(struct file *file, struct vm_area_struct *vma);
 
+//Wang
+
+ssize_t nova_dax_journal_write(struct file *filp,
+	const char __user *buf,	size_t len, loff_t *ppos, bool need_mutex);
+
+
 /* dir.c */
 extern const struct file_operations nova_dir_operations;
 int nova_append_dir_init_entries(struct super_block *sb,
@@ -993,6 +1021,11 @@ int nova_assign_write_entry(struct super_block *sb,
 	struct nova_file_write_entry *entry,
 	bool free);
 
+int nova_update_write_entry(struct super_block *sb,
+	struct nova_inode *pi,
+	struct nova_inode_info_header *sih,
+	struct nova_file_write_entry *entry,
+	struct nova_file_write_entry *entry_to_update);
 /* ioctl.c */
 extern long nova_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 #ifdef CONFIG_COMPAT
@@ -1036,4 +1069,5 @@ void nova_print_inode_log(struct super_block *sb, struct inode *inode);
 void nova_print_inode_log_pages(struct super_block *sb, struct inode *inode);
 void nova_print_free_lists(struct super_block *sb);
 
+int nova_recover_data_journal(struct super_block *sb, struct ptr_pair *pair, int recover);
 #endif /* __NOVA_H */

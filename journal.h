@@ -23,11 +23,20 @@
 #define __NOVA_JOURNAL_H__
 #include <linux/slab.h>
 
+#define NOVA_DATA_JOURNAL_ENTRY_SIZE 1024
+#define NOVA_DATA_JOURNAL_SIZE (NOVA_DATA_JOURNAL_ENTRY_SIZE - 2*sizeof(u64))//Wang 256- 8B addr -8B length
+//struct ptr_pair;
 /* Lite journal */
 struct nova_lite_journal_entry {
 	/* The highest byte of addr is type */
 	u64 addrs[4];
 	u64 values[4];
+};
+
+struct nova_data_journal_entry {
+	u64 addr;
+	u64 length;//0-255
+	u8 data[NOVA_DATA_JOURNAL_SIZE];
 };
 
 int nova_lite_journal_soft_init(struct super_block *sb);
@@ -37,4 +46,23 @@ u64 nova_create_lite_transaction(struct super_block *sb,
 	struct nova_lite_journal_entry *dram_entry2,
 	int entries, int cpu);
 void nova_commit_lite_transaction(struct super_block *sb, u64 tail, int cpu);
+
+//Wang
+u64 next_data_journal(u64 curr_p);
+
+void nova_recover_data_journal_entry(struct super_block *sb,
+	u64 addr, u8 *data, size_t len);
+
+void nova_undo_data_journal_entry(struct super_block *sb,
+	struct nova_data_journal_entry *entry);
+
+u64 nova_append_data_journal_entry(struct super_block *sb, 
+	struct nova_data_journal_entry *data_entry, u64 tail);
+
+void nova_commit_data_transaction(struct super_block *sb, u64 tail, int cpu);
+
+
+int nova_data_journal_soft_init(struct super_block *sb);
+
+int nova_data_journal_hard_init(struct super_block *sb);
 #endif    /* __NOVA_JOURNAL_H__ */

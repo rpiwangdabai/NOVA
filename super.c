@@ -37,6 +37,7 @@
 #include <linux/cred.h>
 #include <linux/list.h>
 #include "nova.h"
+#include "journal.h"
 
 int measure_timing = 0;
 int support_clwb = 0;
@@ -336,6 +337,13 @@ static struct nova_inode *nova_init(struct super_block *sb,
 		printk(KERN_ERR "Lite journal hard initialization failed\n");
 		return ERR_PTR(-EINVAL);
 	}
+	//Wang
+#ifdef JOURNAL_WRITE
+	if (nova_data_journal_hard_init(sb) < 0) {
+		printk(KERN_ERR "Data journal hard initialization failed\n");
+		return ERR_PTR(-EINVAL);
+	}
+#endif
 
 	if (nova_init_inode_inuse_list(sb) < 0)
 		return ERR_PTR(-EINVAL);
@@ -569,6 +577,14 @@ static int nova_fill_super(struct super_block *sb, void *data, int silent)
 		printk(KERN_ERR "Lite journal initialization failed\n");
 		goto out;
 	}
+	//Wang
+#ifdef JOURNAL_WRITE
+	if (nova_data_journal_soft_init(sb)) {
+		retval = -EINVAL;
+		printk(KERN_ERR "Data journal initialization failed\n");
+		goto out;
+	}
+#endif
 
 	blocksize = le32_to_cpu(super->s_blocksize);
 	nova_set_blocksize(sb, blocksize);

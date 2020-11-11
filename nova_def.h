@@ -163,6 +163,8 @@ struct nova_super_block {
 #define NOVA_INODELIST_INO	(4)
 #define NOVA_LITEJOURNAL_INO	(5)
 #define NOVA_INODELIST1_INO	(6)
+//Wang
+#define NOVA_DATAJOURNAL_INO (7)
 
 #define	NOVA_ROOT_INO_START	(NOVA_SB_SIZE * 2)
 

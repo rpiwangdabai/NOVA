@@ -47,6 +47,7 @@ enum timing_category {
 	cow_write_t,
 	copy_to_nvmm_t,
 	dax_get_block_t,
+	journal_write_t,//Wang
 
 	/* Memory operations */
 	memcpy_r_nvmm_t,
@@ -100,6 +101,7 @@ enum stats_category {
 	write_breaks,
 	read_bytes,
 	cow_write_bytes,
+	journal_write_bytes,//Wang
 	fast_checked_pages,
 	thorough_checked_pages,
 	fast_gc_pages,

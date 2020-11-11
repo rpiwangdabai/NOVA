@@ -494,6 +494,45 @@ static int nova_lookup_hole_in_range(struct super_block *sb,
 done:
 	return blocks;
 }
+#ifdef JOURNAL_WRITE
+int nova_update_write_entry(struct super_block *sb,
+	struct nova_inode *pi,
+	struct nova_inode_info_header *sih,
+	struct nova_file_write_entry *entry,
+	struct nova_file_write_entry *entry_to_update)
+{
+	struct nova_file_write_entry *old_entry;
+	void **pentry;
+	unsigned long old_nvmm;
+	unsigned long start_pgoff = entry->pgoff;
+	unsigned int num = entry->num_pages;
+	unsigned long curr_pgoff;
+	int i;
+	int ret = 0;
+	timing_t assign_time;
+
+	NOVA_START_TIMING(assign_t, assign_time);
+	for (i = 0; i < num; i++) {
+		curr_pgoff = start_pgoff + i;
+		
+		pentry = radix_tree_lookup_slot(&sih->tree, curr_pgoff);
+		if (pentry) {
+			old_entry = radix_tree_deref_slot(pentry);
+			if	(old_entry == entry_to_update) {
+				old_nvmm = get_nvmm(sb, sih, old_entry, curr_pgoff);
+				radix_tree_replace_slot(pentry, entry);
+				old_entry->invalid_pages++;
+			}
+		}
+	}
+	
+
+	NOVA_END_TIMING(assign_t, assign_time);
+
+	return ret;
+}
+
+#endif
 
 int nova_assign_write_entry(struct super_block *sb,
 	struct nova_inode *pi,

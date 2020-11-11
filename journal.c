@@ -244,4 +244,194 @@ int nova_lite_journal_hard_init(struct super_block *sb)
 	PERSISTENT_BARRIER();
 	return nova_lite_journal_soft_init(sb);
 }
+//Wang
+#ifdef JOURNAL_WRITE
+u64 next_data_journal(u64 curr_p)
+{
+	size_t size = sizeof(struct nova_data_journal_entry);
 
+	/* One page holds 64 entries with cacheline size */
+	if ((curr_p & (PAGE_SIZE - 1)) + size >= PAGE_SIZE)
+		return (curr_p & PAGE_MASK);
+
+	return curr_p + size;
+}
+
+void nova_recover_data_journal_entry(struct super_block *sb,
+	u64 addr, u8 *data, size_t len)
+{
+	if (WH_DEBUG) {
+		nova_dbg("%s: called", __func__);
+	}
+	memcpy((void *)nova_get_block(sb, addr), (void *)data, len);
+}
+
+
+void nova_undo_data_journal_entry(struct super_block *sb,
+	struct nova_data_journal_entry *entry)
+{
+	size_t len= entry->length;
+	if(!len){
+		nova_err(sb, "%s: undo data journal entry error: length is 0", __func__);
+	}
+	nova_dbg("%s: recover data entry \n", __func__);
+	nova_recover_data_journal_entry(sb, entry->addr, entry->data, len);
+
+}
+
+
+
+
+int nova_recover_data_journal(struct super_block *sb,
+	struct ptr_pair *pair, int recover)
+{
+
+	struct nova_data_journal_entry *entry;
+	u64 temp;
+	//int ret;
+
+	entry = (struct nova_data_journal_entry *)nova_get_block(sb,
+							pair->journal_head);
+	nova_undo_data_journal_entry(sb, entry);
+	
+	if (recover == 2) {
+		temp = next_data_journal(pair->journal_head);
+		entry = (struct nova_data_journal_entry *)nova_get_block(sb,
+							temp);
+		nova_undo_data_journal_entry(sb, entry);
+		
+	}
+
+	pair->journal_head = pair->journal_tail;
+	nova_flush_buffer(&pair->journal_head, CACHELINE_SIZE, 1);
+
+	return 0;
+}
+
+
+u64 nova_append_data_journal_entry(struct super_block *sb, 
+	struct nova_data_journal_entry *data_entry, u64 tail)
+{
+	struct nova_data_journal_entry *entry;
+	
+	if (WH_DEBUG) {
+		nova_dbg("%s \n",__func__);
+	}
+
+	entry = (struct nova_data_journal_entry *)nova_get_block(sb, tail);
+
+	memcpy_to_pmem_nocache(entry, data_entry, 
+			NOVA_DATA_JOURNAL_ENTRY_SIZE-NOVA_DATA_JOURNAL_SIZE+data_entry->length);
+	//memcpy_to_pmem_nocache(entry, data_entry,
+			//sizeof(struct nova_data_journal_entry));
+	return 0;
+}
+
+
+void nova_commit_data_transaction(struct super_block *sb, u64 tail, int cpu)
+{
+	struct ptr_pair *pair;
+
+	if (WH_DEBUG) {
+		nova_dbg("%s \n",__func__);
+	}
+
+	pair = nova_get_data_journal_pointers(sb, cpu);
+	if (!pair || pair->journal_tail != tail){
+		nova_dbg("tail is %llu but jourtail is %llu \n",tail,pair->journal_tail);
+		BUG();
+	}
+
+	pair->journal_head = tail;
+	nova_flush_buffer(&pair->journal_head, CACHELINE_SIZE, 1);
+}
+
+
+
+
+int nova_data_journal_soft_init(struct super_block *sb)
+{
+	struct nova_sb_info *sbi = NOVA_SB(sb);
+	struct ptr_pair *pair;
+	int i;
+	u64 temp;
+
+	if (WH_DEBUG) {
+		nova_dbg("%s \n",__func__);
+	}
+	sbi->data_journal_locks = kzalloc(sbi->cpus * sizeof(spinlock_t),
+					GFP_KERNEL);
+	if (!sbi->data_journal_locks)
+		return -ENOMEM;
+
+	for (i = 0; i < sbi->cpus; i++)
+		spin_lock_init(&sbi->data_journal_locks[i]);
+
+	for (i = 0; i < sbi->cpus; i++) {
+		pair = nova_get_data_journal_pointers(sb, i);
+		if (pair->journal_head == pair->journal_tail)
+			continue;
+
+		/* We only allow up to two uncommited entries */
+		temp = next_data_journal(pair->journal_head);
+		if (pair->journal_tail == temp) {
+			nova_recover_data_journal(sb, pair, 1);
+			continue;
+		}
+
+		temp = next_data_journal(temp);
+		if (pair->journal_tail == temp) {
+			nova_recover_data_journal(sb, pair, 2);
+			continue;
+		}
+
+		/* We are in trouble if we get here*/
+		nova_err(sb, "%s: Wang: data journal %d error: head 0x%llx, "
+				"tail 0x%llx\n", __func__, i,
+				pair->journal_head, pair->journal_tail);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+
+
+// add int nova_data_journal_hard_init
+int nova_data_journal_hard_init(struct super_block *sb)
+{
+	struct nova_sb_info *sbi = NOVA_SB(sb);
+	struct nova_inode fake_pi;
+	struct ptr_pair *pair;
+	unsigned long blocknr = 0;
+	int allocated;
+	int i;
+	u64 block;
+
+	if (WH_DEBUG) {
+		nova_dbg("%s \n",__func__);
+	}
+	fake_pi.nova_ino = NOVA_DATAJOURNAL_INO;
+	fake_pi.i_blk_type = NOVA_BLOCK_TYPE_4K;// set to 4k for data journal
+
+	for (i = 0; i < sbi->cpus; i++) {
+		pair = nova_get_data_journal_pointers(sb, i);
+		if (!pair)
+			return -EINVAL;
+
+		allocated = nova_new_log_blocks(sb, &fake_pi, &blocknr, 1, 1);
+		nova_dbg_verbose("%s: Wang: allocate data log @ 0x%lx\n", __func__,
+							blocknr);
+		if (allocated != 1 || blocknr == 0)
+			return -ENOSPC;
+
+		block = nova_get_block_off(sb, blocknr, NOVA_BLOCK_TYPE_4K);
+		pair->journal_head = pair->journal_tail = block;
+		nova_flush_buffer(pair, CACHELINE_SIZE, 0);
+	}
+
+	PERSISTENT_BARRIER();
+	return nova_data_journal_soft_init(sb);
+}
+
+#endif

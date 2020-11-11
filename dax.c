@@ -18,8 +18,13 @@
 #include <asm/pgtable.h>
 #include <linux/version.h>
 #include "nova.h"
-
-static ssize_t
+#include "journal.h"
+#ifdef DYNAMIC_JOURNAL
+static size_t write_len_average =1024;
+static u64 write_count = 0;
+static u64 write_len_sum = 0;
+#endif
+	static ssize_t
 do_dax_mapping_read(struct file *filp, char __user *buf,
 	size_t len, loff_t *ppos)
 {
@@ -169,11 +174,18 @@ static inline int nova_copy_partial_block(struct super_block *sb,
 	nvmm = get_nvmm(sb, sih, entry, index);
 	ptr = nova_get_block(sb, (nvmm << PAGE_SHIFT));
 	if (ptr != NULL) {
-		if (is_end_blk)
+		if (is_end_blk) {
 			memcpy(kmem + offset, ptr + offset,
 				sb->s_blocksize - offset);
+#ifdef NVM_DELAY
+			ndelay((((sb->s_blocksize - offset-1)>>NVM_BLOCK_SHIFT)+1)<<BLOCK_DELAY_SHIFT);
+#endif
+		}
 		else 
 			memcpy(kmem, ptr, offset);
+#ifdef NVM_DELAY
+			ndelay((((offset-1)>>NVM_BLOCK_SHIFT)+1)<<BLOCK_DELAY_SHIFT);
+#endif
 	}
 
 	return 0;
@@ -279,6 +291,7 @@ int nova_reassign_file_tree(struct super_block *sb,
 	return 0;
 }
 
+
 static int nova_cleanup_incomplete_write(struct super_block *sb,
 	struct nova_inode *pi, struct nova_inode_info_header *sih,
 	unsigned long blocknr, int allocated, u64 begin_tail, u64 end_tail)
@@ -320,6 +333,7 @@ static int nova_cleanup_incomplete_write(struct super_block *sb,
 
 	return 0;
 }
+
 
 ssize_t nova_cow_file_write(struct file *filp,
 	const char __user *buf,	size_t len, loff_t *ppos, bool need_mutex)
@@ -512,11 +526,541 @@ out:
 	return ret;
 }
 
+#ifdef JOURNAL_WRITE
+int nova_reassign_file_tree_nofree(struct super_block *sb,
+	struct nova_inode *pi, struct nova_inode_info_header *sih,
+	u64 begin_tail, struct nova_file_write_entry *old_entry1,
+	struct nova_file_write_entry *old_entry2)
+{
+	struct nova_file_write_entry *entry_data;
+	u64 curr_p = begin_tail;
+	size_t entry_size = sizeof(struct nova_file_write_entry);
+	
+	//first write entry	
+	if (curr_p != pi->log_tail) {
+		if (is_last_entry(curr_p, entry_size))
+			curr_p = next_log_page(sb, curr_p);
+
+		if (curr_p == 0) {
+			nova_err(sb, "%s: File inode %llu log is NULL!\n",
+				__func__, pi->nova_ino);
+			return -EINVAL;
+		}
+
+		entry_data = (struct nova_file_write_entry *)
+					nova_get_block(sb, curr_p);
+
+		if (nova_get_entry_type(entry_data) != FILE_WRITE) {
+			nova_dbg("%s: entry type is not write? %d\n",
+				__func__, nova_get_entry_type(entry_data));
+			curr_p += entry_size;
+			//continue;
+		}
+
+		nova_update_write_entry(sb, pi, sih, entry_data, old_entry1);
+		curr_p += entry_size;
+	}
+
+	//2nd write entry
+	if (curr_p != pi->log_tail) {
+		if (old_entry2 == NULL) {
+			nova_dbg("%s: need to update 2 write entry but 2nd old entry is NULL! \n", __func__);
+		}
+			
+		if (is_last_entry(curr_p, entry_size))
+			curr_p = next_log_page(sb, curr_p);
+
+		if (curr_p == 0) {
+			nova_err(sb, "%s: File inode %llu log is NULL!\n",
+				__func__, pi->nova_ino);
+			return -EINVAL;
+		}
+
+		entry_data = (struct nova_file_write_entry *)
+					nova_get_block(sb, curr_p);
+
+		if (nova_get_entry_type(entry_data) != FILE_WRITE) {
+			nova_dbg("%s: entry type is not write? %d\n",
+				__func__, nova_get_entry_type(entry_data));
+			curr_p += entry_size;
+			//continue;
+		}
+
+		nova_update_write_entry(sb, pi, sih, entry_data, old_entry2);
+		curr_p += entry_size;
+	}
+	
+	if(curr_p != pi->log_tail) {
+		nova_dbg("%s have more than 2 write entry \n",__func__);
+	}
+
+	return 0;
+}
+
+#if 0
+int nova_reassign_file_tree_nofree(struct super_block *sb,
+	struct nova_inode *pi, struct nova_inode_info_header *sih,
+	u64 begin_tail)
+{
+	struct nova_file_write_entry *entry_data;
+	u64 curr_p = begin_tail;
+	size_t entry_size = sizeof(struct nova_file_write_entry);
+
+	while (curr_p != pi->log_tail) {
+		if (is_last_entry(curr_p, entry_size))
+			curr_p = next_log_page(sb, curr_p);
+
+		if (curr_p == 0) {
+			nova_err(sb, "%s: File inode %llu log is NULL!\n",
+				__func__, pi->nova_ino);
+			return -EINVAL;
+		}
+
+		entry_data = (struct nova_file_write_entry *)
+					nova_get_block(sb, curr_p);
+
+		if (nova_get_entry_type(entry_data) != FILE_WRITE) {
+			nova_dbg("%s: entry type is not write? %d\n",
+				__func__, nova_get_entry_type(entry_data));
+			curr_p += entry_size;
+			continue;
+		}
+
+		nova_assign_write_entry(sb, pi, sih, entry_data, false);
+		curr_p += entry_size;
+	}
+
+	return 0;
+}
+#endif
+bool nova_dax_journal_write_check(struct file *filp, const char __user *buf,
+	size_t len, loff_t *ppos)
+{
+
+	struct address_space *mapping = filp->f_mapping;
+	struct inode    *inode = mapping->host;
+	struct super_block *sb = inode->i_sb;
+	struct nova_inode_info *si = NOVA_I(inode);
+	struct nova_inode_info_header *sih = &si->header;
+
+	loff_t pgoff_start=(*ppos)>> sb->s_blocksize_bits;//block start
+	loff_t pgoff_end=(*ppos+len)>> sb->s_blocksize_bits;
+	loff_t pgoff_file=inode->i_size>>sb->s_blocksize_bits;
+	void **entry1=NULL;
+	//void **entry2=NULL;
+
+	//pgoff_start=(*ppos)>> sb->s_blocksize_bits;//block start
+	//pgoff_end=(*ppos+len)>> sb->s_blocksize_bits;
+
+	if (WH_DEBUG == 2) {
+		nova_dbg("%s is called\n",__func__);
+	}
+		
+	if (inode->i_size == 0 || (pgoff_end > pgoff_file)) {
+		if (WH_DEBUG == 2) {
+			nova_dbg("%s extend file size; return false\n",__func__);
+			nova_dbg("%s :pgoff_end %llu ; pgoff_file %llu \n",__func__, pgoff_end, pgoff_file);
+		}
+		return false;
+	}
+	
+#ifdef DYNAMIC_JOURNAL
+	write_len_sum += len;
+	if(write_count == 1024) {
+		write_len_average = write_len_sum>>10 > NOVA_DATA_JOURNAL_SIZE? NOVA_DATA_JOURNAL_SIZE: write_len_sum>>10;
+		write_len_sum = 0;
+		write_count = 0;
+	} else {
+		write_count++;
+	}
+
+	if (len>write_len_average) {
+#else
+	if (len>NOVA_DATA_JOURNAL_SIZE) {
+#endif
+		if (WH_DEBUG == 2) {
+			nova_dbg("%s len is too large; return false\n",__func__);
+		}
+		return false;
+	}
+//	if (filp->f_flags & O_APPEND){
+//		if (WH_DEBUG == 2) {
+//			nova_dbg("%s append write; return false\n",__func__);
+//		}
+//		return false;
+//	}
+
+	//check whether there is a write_entry for page to be written	
+	entry1 = radix_tree_lookup_slot(&sih->tree, pgoff_start);
+	if (entry1 == NULL) {
+		if (WH_DEBUG == 2) {
+			nova_dbg("%s entry not found; return false\n",__func__);
+		}
+		return false;
+	}
+	
+	if (pgoff_start != pgoff_end) {
+		return false;
+	//	entry2 = radix_tree_lookup_slot(&sih->tree, pgoff_end);	
+	//	if(entry2 == NULL){
+	//		if (WH_DEBUG == 2) {
+	//			nova_dbg("%s entry 2 not found; return false\n",__func__);
+	//		}
+	//		return false;
+	//	}
+	}
+	//if there is one hole, give up journal write.
+	
+	//both or current page is available for inplace update
+	if (WH_DEBUG == 2) {
+		nova_dbg("%s return true\n",__func__);
+	}
+	return true;
+
+}
+
+ssize_t nova_dax_journal_write(struct file *filp,
+	const char __user *buf,	size_t len, loff_t *ppos, bool need_mutex)
+{
+	struct address_space *mapping = filp->f_mapping;
+	struct inode    *inode = mapping->host;
+	struct nova_inode_info *si = NOVA_I(inode);
+	struct nova_inode_info_header *sih = &si->header;
+	struct super_block *sb = inode->i_sb;
+	//struct nova_sb_info *sbi = NOVA_SB(sb);
+	struct nova_inode *pi;
+	void **pentry1, **pentry2;
+	struct nova_file_write_entry *old_entry1, *old_entry2; //*update_entry1, *update_entry2;
+	struct nova_file_write_entry entry_data1, entry_data2;//mtime changes, need to replace write entry
+
+	struct nova_data_journal_entry journal_entry_data1,journal_entry_data2;
+	struct ptr_pair *journal_ptr;
+	
+	loff_t pos;
+	size_t count1, count2, offset;
+	size_t copied = 0;
+	long status = 0;
+
+	loff_t pgoff_start = (*ppos) >> sb->s_blocksize_bits;//block start
+	loff_t pgoff_end = (*ppos + len) >> sb->s_blocksize_bits;
+	//loff_t pgoff_max;
+
+	timing_t journal_write_time;
+	u64 temp_tail = 0, begin_tail = 0;
+	u64 curr_entry;
+	u64 temp;
+	u32 time;
+	int cpuid;
+	int ret;
+	unsigned long nvmm;
+	void *ptr1, *ptr2;	
+	
+	if (WH_DEBUG == 1) {
+		nova_dbg("%s: pgoff_start=%llu, pgoff_end=%llu, len=%zu", __func__,
+				pgoff_start, pgoff_end, len);
+	}
+	
+	
+	if (len == 0)
+		return 0;
+
+	//Since it is update in place, it can be mmaped
+	//do not check mapping
+	NOVA_START_TIMING(journal_write_t, journal_write_time);
+	
+	sb_start_write(inode->i_sb);
+	if (need_mutex)
+		mutex_lock(&inode->i_mutex);
+	
+	if (!access_ok(VERIFY_READ, buf, len)) {
+		ret = -EFAULT;
+		goto out;
+	}	
+
+	pos = *ppos;
+	
+	if (filp->f_flags & O_APPEND)
+		pos=i_size_read(inode);
+	//O_APPEND is checked in nova_dax_journal_write_check()
+
+	
+	pi = nova_get_inode(sb, inode);
+	//offset = pos & (sb->s_blocksize - 1);//relative offset in block
+	offset = pos & (nova_inode_blk_size(pi) - 1);
+	
+	if (WH_DEBUG == 1) {
+		nova_dbg("%s: pos=%llu, offset=%zu", __func__, pos, offset);
+	}
+	
+	ret = file_remove_privs(filp);
+	if (ret) {
+		goto out;
+	}
+	
+	inode->i_ctime = inode->i_mtime = CURRENT_TIME_SEC;
+	time = CURRENT_TIME_SEC.tv_sec;
+	
+	nova_dbgv("%s: inode %lu, offset %lld, count %lu\n",
+			__func__, inode->i_ino,	pos, len);
+	
+	//start to journal
+	//get first write entry
+	pentry1 = radix_tree_lookup_slot(&sih->tree, pgoff_start);
+		
+	//pgoff_max=old_entry1->pgoff+old_entry1->num_pages;
+
+	//May need another write entry
+	if (pgoff_start != pgoff_end) {
+		if (WH_DEBUG == 1) {
+			nova_dbg("%s: \n pgoff_start %lld != pgoff_end %lld \n",
+					__func__, pgoff_start, pgoff_end);
+		}
+		pentry2 = radix_tree_lookup_slot(&sih->tree, pgoff_end);
+		if(pentry2 == pentry1){
+			pentry2 = NULL;
+			if (WH_DEBUG == 1) {
+				nova_dbg("two block in the same write entry \n");
+			}
+		}	
+	} else {
+		pentry2 = NULL;
+	}
+
+	old_entry1 = radix_tree_deref_slot(pentry1);
+	
+	if (WH_DEBUG == 1) {
+		nova_dbg("old entry 1 with pgoff=%llu num_pages=%u block=%llu",
+				old_entry1->pgoff, old_entry1->num_pages, old_entry1->block);
+	}
+
+	if (pentry2) {
+		old_entry2 = radix_tree_deref_slot(pentry2);
+	} else {
+		old_entry2 = NULL;
+	}
+	//if entry2==NULL, we only need one journal entry
+	//build entry_data1
+	//get block
+	if (WH_DEBUG == 1) {
+		nova_dbg("%s: get_nvmm called\n",__func__);
+	}
+	nvmm = get_nvmm(sb, sih, old_entry1, pgoff_start);
+	
+	/*start block byte*/
+	ptr1 = nova_get_block(sb, (nvmm << PAGE_SHIFT)+offset);
+
+	journal_entry_data1.addr = (u64)(nvmm << PAGE_SHIFT)+offset;
+	count1 = journal_entry_data1.length = old_entry2 != NULL? nova_inode_blk_size(pi) - offset : len;
+	//nova_dbg("write entry 1 count1=%zu \n",count1);
+	
+	//copy data; Or use __copy_from_user_inatomic_nocache?
+	copy_to_user(journal_entry_data1.data, ptr1, count1);
+	
+	//fill rest with zero
+	//memset(journal_entry_data1->data + count1, 0, NOVA_DATA_JOURNAL_SIZE - count1);
+	
+	//build and append journal entry2
+	if (old_entry2) {
+		nvmm = get_nvmm(sb, sih, old_entry2, pgoff_end);
+		/*start block byte*/
+		ptr2 = nova_get_block(sb, nvmm << PAGE_SHIFT);		
+		
+		journal_entry_data2.addr=(u64)nvmm << PAGE_SHIFT;
+		count2 = journal_entry_data2.length=((pos + len) & (nova_inode_blk_size(pi) - 1));
+		//nova_dbg("write entry 2 count1=%zu \n",count2);
+
+		copy_to_user(journal_entry_data2.data, ptr2, count2);
+		//memset(journal_entry_data2->data + count2, 0, NOVA_DATA_JOURNAL_SIZE - count2);
+	}
+
+	//Journal old data
+	cpuid = smp_processor_id();
+	journal_ptr = nova_get_data_journal_pointers(sb,cpuid);
+	temp = journal_ptr->journal_tail;	
+
+	nova_append_data_journal_entry(sb, &journal_entry_data1, temp);
+	temp = next_data_journal(temp);
+	
+	if (old_entry2) {
+		nova_append_data_journal_entry(sb, &journal_entry_data2, temp); 
+		temp = next_data_journal(temp);
+	}
+	journal_ptr->journal_tail = temp;
+
+	//Memcpy write
+	while (copied != count1) {
+		copied = count1 - memcpy_to_pmem_nocache(ptr1, buf + copied, count1 - copied);
+		if (WH_DEBUG == 1) {
+			nova_dbg("Memcpy count1 =%zu copied = %zu", count1, copied);
+		}
+	}
+
+	//Build write entry 1
+	entry_data1.pgoff = cpu_to_le64(old_entry1->pgoff);
+	entry_data1.num_pages = cpu_to_le32(old_entry1->num_pages);
+	entry_data1.invalid_pages = cpu_to_le32(old_entry1->invalid_pages);
+	entry_data1.block = cpu_to_le64(old_entry1->block);
+	//entry_data1.size = cpu_to_le64(old_entry1->size);
+	
+	if (pos + copied > inode->i_size)
+		entry_data1.size = cpu_to_le64(pos + copied);
+	else
+		entry_data1.size = cpu_to_le64(inode->i_size);
+	
+	//Only change modifed time
+	entry_data1.mtime = cpu_to_le32(time);
+	nova_set_entry_type((void *)&entry_data1, FILE_WRITE);
+	if (WH_DEBUG == 1) {
+		nova_dbg("%s: \n build write entry 1: pgoff=%llu, num_pages=%u, block=%llu \n",
+				__func__, entry_data1.pgoff, entry_data1.num_pages, entry_data1.block);
+	}
+	
+	temp_tail = pi->log_tail;
+	curr_entry = nova_append_file_write_entry(sb, pi, inode,
+							&entry_data1, temp_tail);	
+
+	if (!curr_entry) {
+		nova_dbg("%s: append inode entry failed\n", __func__);
+		ret = -ENOSPC;
+		goto undo;
+	}
+
+	if (begin_tail == 0)
+		begin_tail = curr_entry;
+	
+	temp_tail = curr_entry + sizeof(struct nova_file_write_entry);
+	
+	if (old_entry2) {
+		while (copied != len){
+			copied += count2 - memcpy_to_pmem_nocache(ptr2, buf+copied, len-copied);
+			if (WH_DEBUG == 1) {
+				nova_dbg("Memcpy entry 2 copied = %zu remain bytes = %zu", copied, len - copied);
+			}
+		}
+		//Build write entry 2
+		entry_data2.pgoff = cpu_to_le64(old_entry2->pgoff);
+		entry_data2.num_pages = cpu_to_le32(old_entry2->num_pages);
+		entry_data2.invalid_pages = cpu_to_le32(old_entry2->invalid_pages);
+		entry_data2.block = cpu_to_le64(old_entry2->block);
+		//Only change modifed time
+		entry_data2.mtime = cpu_to_le32(time);
+		entry_data2.size=cpu_to_le64(old_entry2->size);
+	
+		if (WH_DEBUG == 1) {
+			nova_dbg("finish write entry 2 with pgoff=%llu num_pages=%u block=%llu",
+					entry_data2.pgoff, entry_data2.num_pages, entry_data2.block);
+		}
+		curr_entry = nova_append_file_write_entry(sb, pi, inode,
+							&entry_data2, temp_tail);			
+
+		if (!curr_entry) {
+			nova_dbg("%s: append inode entry failed\n", __func__);
+			ret = -ENOSPC;
+			goto undo;
+		}
+		temp_tail = curr_entry + sizeof(struct nova_file_write_entry);
+	}
+
+	if (copied > 0) {
+		pos+=copied;
+	}
+
+	if (unlikely(copied != len)) {
+		nova_dbg("%s ERROR!: %p, bytes %lu, copied %lu\n",
+		__func__, ptr1 , len, copied);
+		if (status >= 0)
+			status = -EFAULT;
+	}
+
+	
+	
+	nova_update_tail(pi, temp_tail);
+	
+	//Update radix tree without free data block
+	//update_entry1 = (struct nova_file_write_entry *)nova_get_block(sb, (u64)&entry_data1);
+	
+	ret = nova_reassign_file_tree_nofree(sb, pi, sih, begin_tail, old_entry1, old_entry2);
+	
+	//ret = nova_assign_write_entry(sb, pi, sih, update_entry1, false);
+	//if (old_entry2){
+	//	update_entry2 = (struct nova_file_write_entry *)
+	//				nova_get_block(sb, (u64)&entry_data2);
+		//ret += nova_assign_write_entry(sb, pi, sih, &entry_data2, false);
+	//}
+	
+	if (ret) {
+		nova_dbg("%s: ERROR %d\n", __func__, ret);
+		goto undo;
+	}
+
+	ret=copied;	
+	
+	*ppos = pos;
+	if (pos > inode->i_size) {
+		i_size_write(inode, pos);
+		sih->i_size = pos;
+	}
+	//Commit write change journal head to tail
+	nova_commit_data_transaction(sb, temp, cpuid);
+	
+undo:
+	//Append file entry failure undo 
+	if (ret<0){
+		if (old_entry2){
+			nova_recover_data_journal(sb, journal_ptr, 2);	
+		} else {
+			nova_recover_data_journal(sb, journal_ptr, 1);
+		}
+	}
+
+out:
+	if (need_mutex)
+		mutex_unlock(&inode->i_mutex);
+	sb_end_write(inode->i_sb);
+	NOVA_END_TIMING(journal_write_t, journal_write_time);	
+	NOVA_STATS_ADD(journal_write_bytes, copied);
+	if (WH_DEBUG == 1) {
+		nova_dbg("%s: return %d \n", __func__, ret);
+	}
+	return ret;
+
+}
+
+
+ssize_t nova_dax_file_write(struct file *filp, const char __user *buf,
+	size_t len, loff_t *ppos)
+{	
+	if (WH_DEBUG == 2) {
+		nova_dbg("%s called \n", __func__);
+	}
+	if (nova_dax_journal_write_check(filp, buf, len, ppos)){// start journal write
+		return nova_dax_journal_write(filp, buf, len, ppos, true);
+	} else {
+		return nova_cow_file_write(filp, buf, len, ppos, true);
+	}
+}
+
+#endif /*JOURNAL_WRITE*/ 
+
+#ifndef JOURNAL_WRITE
+
+ssize_t nova_dax_file_write(struct file *filp, const char __user *buf,
+	size_t len, loff_t *ppos)
+{	
+	return nova_cow_file_write(filp, buf, len, ppos, true);
+	
+}
+
+
+#endif
+
+#if 0
 ssize_t nova_dax_file_write(struct file *filp, const char __user *buf,
 	size_t len, loff_t *ppos)
 {
 	return nova_cow_file_write(filp, buf, len, ppos, true);
 }
+#endif
 
 /*
  * return > 0, # of blocks mapped or allocated.
